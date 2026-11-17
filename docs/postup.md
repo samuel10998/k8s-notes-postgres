@@ -38,6 +38,8 @@ git rm -rf --cached logs/
 
 **Poučenie:** `.gitignore` vytvoriť pred prvým `git add`.
 
+---
+
 ## Krok 2: Dockerfile (`feature/docker`)
 
 **Cieľ:** malý image API, ktorý sa postaví vždy rovnako a nebeží ako root.
@@ -193,3 +195,155 @@ git push -u origin feature/docker
 ```
 
 Pri prvom pushi novej vetvy treba `-u origin <vetva>`, potom stačí `git push`. Potom pull request do `main`, merge, `git switch main` a `git pull`.
+
+---
+
+## Krok 3: lokálny klaster (`feature/cluster`)
+
+**Cieľ:** klaster, ktorý si ktokoľvek vytvorí z repa jedným príkazom, s presnou verziou Kubernetes, a v ňom image `notes-api` bez registra.
+
+### Prečo kind a nie Kubernetes z Docker Desktop
+
+Kind (Kubernetes in Docker) spúšťa každý uzol klastra ako Docker kontajner. Používa sa na lokálny vývoj, testovanie a v CI pipeline. V produkcii by bol spravovaný klaster (AKS, EKS, GKE) alebo OpenShift.
+
+| | Docker Desktop Kubernetes | kind z config súboru |
+|---|---|---|
+| vytvorenie | klik v nastaveniach | príkaz a súbor v repe |
+| zopakuje ho niekto iný | nie | áno, z rovnakého súboru |
+| verzia Kubernetes | podľa Docker Desktop | presne určená |
+| počet uzlov | 1 | koľko zadám |
+| zmazanie a nový klaster | zložité | jeden príkaz |
+
+### Môj klaster vs. predvolený `kind create cluster`
+
+| | Predvolený (bez configu) | Môj (`cluster/kind-config.yaml`) |
+|---|---|---|
+| meno, kontext | `kind`, `kind-kind` | `notes`, `kind-notes` |
+| uzly | 1 uzol, ktorý je control-plane aj worker | 1 control-plane + 2 workery |
+| verzia | predvolená pre danú verziu kind (pri kind 0.33.0 je to 1.37) | `v1.35.8`, presne určená |
+| kde bežia Pody | na jedinom uzle | na workeroch, control-plane má taint a appky na ňom nebežia |
+
+S tromi uzlami vidno, ako scheduler rozdeľuje Pody na rôzne uzly, a dá sa vyskúšať výpadok uzla.
+
+### Verzie
+
+```powershell
+winget install Kubernetes.kind
+kind version
+kubectl version --client
+```
+
+```
+kind v0.33.0 go1.26.7 windows/amd64
+Client Version: v1.34.1
+```
+
+**Prečo presná verzia Kubernetes:**
+- `kubectl` je podporovaný len do rozdielu 1 minor verzie od klastra. Pri kubectl 1.34 to znamená klaster 1.33 až 1.35. Predvolená 1.37 je príliš ďaleko a `kubectl` na to upozorní, niektoré príkazy sa môžu správať inak.
+- Bez určenej verzie by klaster dostal tú, ktorú má práve nainštalovaná verzia kind. Po aktualizácii kind by bol iný, a teda nie opakovateľný.
+- V praxi sa lokálny klaster nastavuje na rovnakú verziu ako produkcia.
+
+**Prečo musí byť image pri každom uzle:** uzol bez `image:` dostane predvolenú verziu kind (1.37). Control-plane by mal 1.35 a workery 1.37. Kubelet na workeri nesmie byť novší ako API server na control-plane, takže taký klaster nie je podporovaný a môže sa správať nepredvídateľne.
+
+**Ako som vybral image:**
+1. zistil som verziu kind (`0.33.0`) a kubectl (`1.34.1`)
+2. v release notes tejto verzie kind na GitHube (`kubernetes-sigs/kind`, Releases) som v časti „Images pre-built for this release“ vybral image s verziou o najviac 1 minor od kubectl
+3. skopíroval som ho celý aj s digestom: `kindest/node:v1.35.8@sha256:07b2536e...`
+
+Node image patrí ku konkrétnej verzii kind. Image z inej verzie nemusí s mojím kind fungovať, napríklad pri `kind load`. Digest zaručí, že dostanem presne ten image, nie iný s rovnakým tagom. Kind 0.33.0 a tento image som mal aj v prvom projekte.
+
+### Config
+
+`cluster/kind-config.yaml`:
+- `kind: Cluster`, `apiVersion: kind.x-k8s.io/v1alpha4`. Nie je to objekt Kubernetes, číta ho len `kind create cluster`, nie `kubectl apply`.
+- `name: notes`
+- `nodes`: control-plane a 2 workery, každý s rovnakým `image:`
+
+### Vytvorenie a overenie
+
+```powershell
+kind create cluster --config cluster/kind-config.yaml
+```
+
+| Krok vo výstupe | Čo sa stalo |
+|---|---|
+| Ensuring node image | stiahol `kindest/node:v1.35.8` |
+| Preparing nodes | spustil 3 Docker kontajnery, každý je jeden uzol |
+| Writing configuration | pripravil konfiguráciu pre `kubeadm` |
+| Starting control-plane | API server, etcd, scheduler, controller manager |
+| Installing CNI | sieť pre Pody (kindnet) |
+| Installing StorageClass | predvolená StorageClass `standard` pre PVC |
+| Joining worker nodes | pripojil workery ku control-plane |
+| Set kubectl context | `kubectl` pracuje s `kind-notes` |
+
+```powershell
+kubectl config current-context
+kubectl get nodes
+docker ps
+```
+
+```
+kind-notes
+
+NAME                  STATUS   ROLES           AGE     VERSION
+notes-control-plane   Ready    control-plane   3m8s    v1.35.8
+notes-worker          Ready    <none>          2m55s   v1.35.8
+notes-worker2         Ready    <none>          2m55s   v1.35.8
+```
+
+- `ROLES <none>` pri workeroch je normálne, workery nemajú štítok s rolou
+- v `docker ps` sú 3 kontajnery `kindest/node:v1.35.8`. Pri control-plane je `127.0.0.1:9385->6443/tcp`: 6443 je port API servera a cez náhodný port 9385 na PC sa k nemu pripája `kubectl`.
+- `kubectl config get-contexts` ukázal aj `kind-aspecta` z prvého projektu. Klaster už neexistuje, zostal len záznam v kubeconfigu.
+
+### Image v klastri
+
+Každý uzol má vlastné úložisko image (containerd vnútri kontajnera uzla), oddelené od Docker Desktop. `notes-api` nie je v žiadnom registri, takže si ho uzol nemá odkiaľ stiahnuť. Bez nahratia by Pod skončil v `ErrImagePull` alebo `ImagePullBackOff`.
+
+```
+Docker Desktop                kind load docker-image                  uzly klastra
+docker images                                                       (containerd)
+notes-api:1.0.0  ──►  export image do archívu  ──►  import  ──►  notes-control-plane
+notes-api:1.1.0                                      import  ──►  notes-worker
+                                                     import  ──►  notes-worker2
+```
+
+`kind load` tu nahrádza register. V praxi by CI pipeline image pushla do registra (Docker Hub, GHCR, ACR) a uzly by si ho stiahli samy.
+
+```powershell
+kind load docker-image notes-api:1.0.0 notes-api:1.1.0 --name notes
+docker exec notes-worker crictl images | Select-String notes-api
+```
+
+```
+Image: "notes-api:1.0.0" with ID "sha256:620719b4..." not yet present on node "notes-worker2", loading...
+... (2 image × 3 uzly = 6 riadkov)
+
+docker.io/library/notes-api   1.0.0   fbd2c16680c99   10.2MB
+docker.io/library/notes-api   1.1.0   6ef8726983a7d   10.2MB
+```
+
+- `--name notes` je meno klastra. Bez neho by kind hľadal klaster `kind`.
+- PostgreSQL sa nenahráva, je to oficiálny image a uzol si ho stiahne z Docker Hubu sám.
+- `docker.io/library/` je plné meno image. Krátke `notes-api:1.0.0` v manifeste sa doplní rovnako.
+- ID v `crictl` sú iné ako v `docker images`, ale je to ten istý image. Docker ukazuje odtlačok zoznamu manifestov, `crictl` odtlačok konfigurácie (oba boli vo výstupe buildu).
+- Pri tagu ako `1.0.0` má Pod predvolené `imagePullPolicy: IfNotPresent` a použije image z uzla. Pri `latest` by sa stále pokúšal sťahovať z registra.
+- Po zmazaní a novom vytvorení klastra, aj po každom novom builde, treba `kind load` zopakovať.
+
+### Problémy
+
+| Problém | Príčina | Riešenie |
+|---|---|---|
+| `kind` nie je rozpoznaný príkaz | kind nebol na tomto PC nainštalovaný | `winget install Kubernetes.kind` |
+| po inštalácii stále nerozpoznaný | PowerShell si `PATH` načítal pred inštaláciou | zatvoriť a otvoriť nový PowerShell |
+| `cannot find the path specified` pri `kind create cluster` | bol som v priečinku `logs`, relatívne cesty sa počítali od neho. Transcript išiel do `logs\logs\`. | spúšťať príkazy z koreňa repa |
+| `image:` odsadené viac ako `role:` | YAML ho bral ako pokračovanie hodnoty `role` | kľúče jednej položky zoznamu musia začínať v rovnakom stĺpci |
+
+### Git
+
+```powershell
+git switch -c feature/cluster
+git add cluster/kind-config.yaml
+git commit -m "added kind cluster (control-plane + 2 workers)"
+git push -u origin feature/cluster
+```
+
